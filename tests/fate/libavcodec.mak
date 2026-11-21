@@ -117,7 +117,7 @@ fate-mathops: libavcodec/tests/mathops$(EXESUF)
 fate-mathops: CMD = run libavcodec/tests/mathops$(EXESUF)
 fate-mathops: CMP = null
 
-FATE_LIBAVCODEC-$(CONFIG_JPEG2000_ENCODER) += fate-j2k-dwt
+FATE_LIBAVCODEC-yes += fate-j2k-dwt
 fate-j2k-dwt: libavcodec/tests/jpeg2000dwt$(EXESUF)
 fate-j2k-dwt: CMD = run libavcodec/tests/jpeg2000dwt$(EXESUF)
 
