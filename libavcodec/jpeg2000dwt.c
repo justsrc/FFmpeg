@@ -443,17 +443,34 @@ static void dwt_decode97_float(DWTContext *s, float *t)
         // HOR_SD
         l = line + mh;
         for (lp = 0; lp < lv; lp++) {
-            int i, j = 0;
-            // copy with interleaving
-            for (i = mh; i < lh; i += 2, j++)
-                l[i] = data[w * lp + j];
-            for (i = 1 - mh; i < lh; i += 2, j++)
-                l[i] = data[w * lp + j];
+            /* copy with interleaving, fused into one loop. mh is 0 or 1: the
+             * first original loop (l[mh + 2j], count c1) reads the row's first
+             * c1 samples, the second (l[1 - mh + 2j], count c2) continues at
+             * c1. When mh == 1 the two streams swap which line parity they
+             * land on; swapping the source offsets instead keeps the line
+             * positions a statically adjacent pair (2j, 2j+1) so the compiler
+             * can emit interleaved stores instead of per-lane scatters. The
+             * values are moved unmodified, so this is bit-exact by
+             * construction. */
+            int j, c1 = (lh - mh + 1) >> 1, c2 = (lh + mh) >> 1;
+            int eoff = mh ? c1 : 0, ooff = mh ? 0 : c1;
+            int cE = mh ? c2 : c1, cO = mh ? c1 : c2;
+            const int cmin = FFMIN(cE, cO);
+            const float *src = data + (size_t)w * lp;
+
+            for (j = 0; j < cmin; j++) {
+                l[2 * j]     = src[eoff + j];
+                l[2 * j + 1] = src[ooff + j];
+            }
+            for (; j < cE; j++)
+                l[2 * j] = src[eoff + j];
+            for (; j < cO; j++)
+                l[2 * j + 1] = src[ooff + j];
 
             sr_1d97_float(line, mh, mh + lh);
 
-            for (i = 0; i < lh; i++)
-                data[w * lp + i] = l[i];
+            for (j = 0; j < lh; j++)
+                data[(size_t)w * lp + j] = l[j];
         }
 
         // VER_SD
