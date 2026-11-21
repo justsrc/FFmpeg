@@ -41,6 +41,11 @@
             src[i] = (float)rnd() / (UINT_MAX >> 5); \
     } while (0)
 
+static const int mct_sizes[] = {
+    0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33,
+    63, 64, 65, 127, 128, 129, 255, 256, 257, 511, BUF_SIZE
+};
+
 static void check_rct_int(void)
 {
     LOCAL_ALIGNED_32(int32_t, src, [BUF_SIZE*3]);
@@ -49,18 +54,29 @@ static void check_rct_int(void)
     int32_t *ref0 = &ref[BUF_SIZE*0], *new0 = &new[BUF_SIZE*0];
     int32_t *ref1 = &ref[BUF_SIZE*1], *new1 = &new[BUF_SIZE*1];
     int32_t *ref2 = &ref[BUF_SIZE*2], *new2 = &new[BUF_SIZE*2];
+    size_t n;
 
     declare_func(void, void *src0, void *src1, void *src2, int csize);
 
+    for (n = 0; n < FF_ARRAY_ELEMS(mct_sizes); n++) {
+        int csize = mct_sizes[n];
+
+        randomize_buffers();
+        memcpy(ref, src, BUF_SIZE * 3 * sizeof(*src));
+        memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
+        call_ref(ref0, ref1, ref2, csize);
+        call_new(new0, new1, new2, csize);
+        /* Compare the csize samples the transform returns. SIMD that
+         * rounds up to a full vector may touch the caller's padding,
+         * which the decoder allocates. */
+        if (memcmp(ref0, new0, csize * sizeof(*src)) ||
+            memcmp(ref1, new1, csize * sizeof(*src)) ||
+            memcmp(ref2, new2, csize * sizeof(*src))) {
+            fprintf(stderr, "csize=%d\n", csize);
+            fail();
+        }
+    }
     randomize_buffers();
-    memcpy(ref, src, BUF_SIZE * 3 * sizeof(*src));
-    memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
-    call_ref(ref0, ref1, ref2, BUF_SIZE);
-    call_new(new0, new1, new2, BUF_SIZE);
-    if (memcmp(ref0, new0, BUF_SIZE * sizeof(*src)) ||
-        memcmp(ref1, new1, BUF_SIZE * sizeof(*src)) ||
-        memcmp(ref2, new2, BUF_SIZE * sizeof(*src)))
-        fail();
     memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
     bench_new(new0, new1, new2, BUF_SIZE);
 }
@@ -74,17 +90,29 @@ static void check_ict_float(void)
     float *ref1 = &ref[BUF_SIZE*1], *new1 = &new[BUF_SIZE*1];
     float *ref2 = &ref[BUF_SIZE*2], *new2 = &new[BUF_SIZE*2];
 
+    size_t n;
+
     declare_func(void, void *src0, void *src1, void *src2, int csize);
 
+    for (n = 0; n < FF_ARRAY_ELEMS(mct_sizes); n++) {
+        int csize = mct_sizes[n];
+
+        randomize_buffers_float();
+        memcpy(ref, src, BUF_SIZE * 3 * sizeof(*src));
+        memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
+        call_ref(ref0, ref1, ref2, csize);
+        call_new(new0, new1, new2, csize);
+        /* Compare the csize samples the transform returns. SIMD that
+         * rounds up to a full vector may touch the caller's padding,
+         * which the decoder allocates. */
+        if (!float_near_abs_eps_array(ref0, new0, 1.0e-5, csize) ||
+            !float_near_abs_eps_array(ref1, new1, 1.0e-5, csize) ||
+            !float_near_abs_eps_array(ref2, new2, 1.0e-5, csize)) {
+            fprintf(stderr, "csize=%d\n", csize);
+            fail();
+        }
+    }
     randomize_buffers_float();
-    memcpy(ref, src, BUF_SIZE * 3 * sizeof(*src));
-    memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
-    call_ref(ref0, ref1, ref2, BUF_SIZE);
-    call_new(new0, new1, new2, BUF_SIZE);
-    if (!float_near_abs_eps_array(ref0, new0, 1.0e-5, BUF_SIZE) ||
-        !float_near_abs_eps_array(ref1, new1, 1.0e-5, BUF_SIZE) ||
-        !float_near_abs_eps_array(ref2, new2, 1.0e-5, BUF_SIZE))
-        fail();
     memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
     bench_new(new0, new1, new2, BUF_SIZE);
 }
