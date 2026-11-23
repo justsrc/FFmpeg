@@ -262,11 +262,6 @@ static inline int ff_jpeg2000_ceildiv(int a, int64_t b)
 /* Set up lookup tables used in TIER-1. */
 void ff_jpeg2000_init_tier1_luts(void);
 
-/* Update significance of a coefficient at current position (x,y) and
- * for neighbors. */
-void ff_jpeg2000_set_significance(Jpeg2000T1Context *t1,
-                                  int x, int y, int negative);
-
 extern uint8_t ff_jpeg2000_sigctxno_lut[4][256];
 extern uint8_t ff_jpeg2000_sigctxno_window_lut[4][512];
 extern uint16_t ff_jpeg2000_sgnctxno_packed_lut[256];
