@@ -2366,20 +2366,28 @@ static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *cod
         av_log(s->avctx, AV_LOG_WARNING, "Synthetic End of Stream Marker Read.\n");
     }
 
+    /* Without ROI the pass below rewrites every coefficient with its own
+     * value; the samples are already in the form the DWT expects. */
+    if (!roi_shift)
+        return 1;
+
     /* Reconstruct the sample values */
+    /* Bit mask for ROI detection */
+    const uint32_t mask = (int64_t)UINT32_MAX >> (M_b + 1);
+
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int32_t sign, n, val;
-            const uint32_t mask  = (int64_t)UINT32_MAX >> (M_b + 1); // bit mask for ROI detection
 
             n = x + (y * t1->stride);
             val = t1->data[n];
             sign = val & INT32_MIN;
             val &= INT32_MAX;
             /* ROI shift, if necessary */
-            if (roi_shift && (((uint32_t)val & ~mask) == 0))
+            if (((uint32_t)val & ~mask) == 0)
                 val = (uint32_t)val << roi_shift;
-            t1->data[n] = val | sign; /* NOTE: Binary point for reconstruction value is located in 31 - M_b */
+            /* NOTE: binary point of the reconstruction value is at 31 - M_b */
+            t1->data[n] = val | sign;
         }
     }
     return 1;
