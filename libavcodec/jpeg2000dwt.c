@@ -375,8 +375,6 @@ static void dwt_decode53(DWTContext *s, int *t)
 
 static void sr_1d97_float(float *p, int i0, int i1)
 {
-    int i;
-
     if (i1 <= i0 + 1) {
         if (i0 == 1)
             p[1] *= F_LFTG_K/2;
@@ -387,17 +385,43 @@ static void sr_1d97_float(float *p, int i0, int i1)
 
     extend97_float(p, i0, i1);
 
-    for (i = (i0 >> 1) - 1; i < (i1 >> 1) + 2; i++)
-        p[2 * i]     -= F_LFTG_DELTA * (p[2 * i - 1] + p[2 * i + 1]);
-    /* step 4 */
-    for (i = (i0 >> 1) - 1; i < (i1 >> 1) + 1; i++)
-        p[2 * i + 1] -= F_LFTG_GAMMA * (p[2 * i]     + p[2 * i + 2]);
-    /*step 5*/
-    for (i = (i0 >> 1); i < (i1 >> 1) + 1; i++)
-        p[2 * i]     += F_LFTG_BETA  * (p[2 * i - 1] + p[2 * i + 1]);
-    /* step 6 */
-    for (i = (i0 >> 1); i < (i1 >> 1); i++)
-        p[2 * i + 1] += F_LFTG_ALPHA * (p[2 * i]     + p[2 * i + 2]);
+    /* Steps 1+2 fused in one ascending pass. Step 1 writes E1[i] and step 2
+     * reads E1[i] and E1[i+1], so O2[i-1] can be emitted as soon as E1[i] is
+     * known; the original O[i-1] is carried from the previous iteration
+     * because its slot has already been overwritten by then. Each pass now
+     * touches every element once instead of twice, and the operands and
+     * evaluation order are unchanged, so the result is bit-identical. */
+    const int lo = (i0 >> 1) - 1, hi = i1 >> 1;
+    float op = p[2 * lo - 1], e1p = 0.0f;
+    int i;
+
+    for (i = lo; i < hi + 2; i++) {
+        float o1 = p[2 * i + 1];
+        float e1 = p[2 * i] - F_LFTG_DELTA * (op + o1);
+
+        p[2 * i] = e1;
+        if (i > lo)
+            p[2 * i - 1] = op - F_LFTG_GAMMA * (e1p + e1);
+
+        op   = o1;
+        e1p  = e1;
+    }
+
+    /* Steps 3+4 fused the same way, reading back E1 and O2. */
+    const int lo3 = i0 >> 1, hi3 = i1 >> 1;
+    float o2p = p[2 * lo3 - 1], e3p = 0.0f;
+
+    for (i = lo3; i < hi3 + 1; i++) {
+        float o2c = p[2 * i + 1];
+        float e3  = p[2 * i] + F_LFTG_BETA * (o2p + o2c);
+
+        p[2 * i] = e3;
+        if (i > lo3)
+            p[2 * i - 1] = o2p + F_LFTG_ALPHA * (e3p + e3);
+
+        o2p = o2c;
+        e3p = e3;
+    }
 }
 
 static void dwt_decode97_float(DWTContext *s, float *t)
