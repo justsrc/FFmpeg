@@ -121,6 +121,11 @@ FATE_LIBAVCODEC-$(CONFIG_JPEG2000_ENCODER) += fate-j2k-dwt
 fate-j2k-dwt: libavcodec/tests/jpeg2000dwt$(EXESUF)
 fate-j2k-dwt: CMD = run libavcodec/tests/jpeg2000dwt$(EXESUF)
 
+FATE_LIBAVCODEC-$(CONFIG_JPEG2000_DECODER) += fate-j2k-mqc
+fate-j2k-mqc: libavcodec/tests/mqc$(EXESUF)
+fate-j2k-mqc: CMD = run libavcodec/tests/mqc$(EXESUF)
+fate-j2k-mqc: CMP = null
+
 FATE_LIBAVCODEC-yes += fate-libavcodec-avcodec
 fate-libavcodec-avcodec: libavcodec/tests/avcodec$(EXESUF)
 fate-libavcodec-avcodec: CMD = run libavcodec/tests/avcodec$(EXESUF)
