@@ -82,7 +82,11 @@ void ff_tag_tree_zero(Jpeg2000TgtNode *t, int w, int h, int val)
     }
 }
 
-uint8_t ff_jpeg2000_sigctxno_lut[256][4];
+uint8_t ff_jpeg2000_sigctxno_lut[4][256];
+/* Zero-coding context of a packed stripe column's 3x3 window, and sign
+ * context and XOR bit of its cardinal-neighbour key. */
+uint8_t ff_jpeg2000_sigctxno_window_lut[4][512];
+uint16_t ff_jpeg2000_sgnctxno_packed_lut[256];
 
 static int getsigctxno(int flag, int bandno)
 {
@@ -127,7 +131,7 @@ static int getsigctxno(int flag, int bandno)
     return 0;
 }
 
-uint8_t ff_jpeg2000_sgnctxno_lut[16][16], ff_jpeg2000_xorbit_lut[16][16];
+uint8_t ff_jpeg2000_sgn_lut[16][16];
 
 static const int contribtab[3][3] = { {  0, -1,  1 }, { -1, -1,  0 }, {  1,  0,  1 } };
 static const int  ctxlbltab[3][3] = { { 13, 12, 11 }, { 10,  9, 10 }, { 11, 12, 13 } };
@@ -151,11 +155,43 @@ static void av_cold jpeg2000_init_tier1_luts(void)
     int i, j;
     for (i = 0; i < 256; i++)
         for (j = 0; j < 4; j++)
-            ff_jpeg2000_sigctxno_lut[i][j] = getsigctxno(i, j);
+            ff_jpeg2000_sigctxno_lut[j][i] = getsigctxno(i, j);
     for (i = 0; i < 16; i++)
-        for (j = 0; j < 16; j++)
-            ff_jpeg2000_sgnctxno_lut[i][j] =
-                getsgnctxno(i + (j << 8), &ff_jpeg2000_xorbit_lut[i][j]);
+        for (j = 0; j < 16; j++) {
+            uint8_t xorbit;
+            int ctxno = getsgnctxno(i + (j << 8), &xorbit);
+
+            /* Context and XOR bit in one byte: the decoder needs both and
+             * fetching them together saves a dependent load per sign. */
+            ff_jpeg2000_sgn_lut[i][j] = ctxno | (xorbit << 4);
+        }
+    /* The packed tier-1 representation indexes a 3x3 window whose neighbour
+     * order differs from the flag words; translate once here. */
+    for (i = 0; i < 512; i++) {
+        int flag = (((i >> 1) & 1) << 0) | (((i >> 5) & 1) << 1) |
+                   (((i >> 3) & 1) << 2) | (((i >> 7) & 1) << 3) |
+                   (((i >> 2) & 1) << 4) | (((i >> 0) & 1) << 5) |
+                   (((i >> 8) & 1) << 6) | (((i >> 6) & 1) << 7);
+
+        for (j = 0; j < 4; j++)
+            ff_jpeg2000_sigctxno_window_lut[j][i] =
+                ff_jpeg2000_sigctxno_lut[j][flag];
+    }
+    /* Cardinal neighbours: significance in bits 6/4/2/0, sign in 7/5/3/1. */
+    for (i = 0; i < 256; i++) {
+        int flag = ((i & 0x40) ? JPEG2000_T1_SIG_N : 0) |
+                   ((i & 0x10) ? JPEG2000_T1_SIG_W : 0) |
+                   ((i & 0x04) ? JPEG2000_T1_SIG_E : 0) |
+                   ((i & 0x01) ? JPEG2000_T1_SIG_S : 0) |
+                   ((i & 0x80) ? JPEG2000_T1_SGN_N : 0) |
+                   ((i & 0x20) ? JPEG2000_T1_SGN_W : 0) |
+                   ((i & 0x08) ? JPEG2000_T1_SGN_E : 0) |
+                   ((i & 0x02) ? JPEG2000_T1_SGN_S : 0);
+        uint8_t xorbit;
+        int ctxno = getsgnctxno(flag, &xorbit);
+
+        ff_jpeg2000_sgnctxno_packed_lut[i] = ctxno | (xorbit << 8);
+    }
 }
 
 void av_cold ff_jpeg2000_init_tier1_luts(void)
@@ -186,6 +222,7 @@ void ff_jpeg2000_set_significance(Jpeg2000T1Context *t1, int x, int y,
     t1->flags[(y - 1) * t1->stride + x + 1] |= JPEG2000_T1_SIG_SW;
     t1->flags[(y - 1) * t1->stride + x - 1] |= JPEG2000_T1_SIG_SE;
 }
+
 
 /* TODO: Implementation of quantization step not finished, see
  * ISO/IEC 15444-1:2002 E.1 and A.6.4. */

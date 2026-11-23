@@ -543,6 +543,29 @@ static int getnmsedec_ref(int x, int bpno)
     return lut_nmsedec_ref0[x & ((1 << NMSEDEC_BITS) - 1)];
 }
 
+/* Update significance of a coefficient at current position (x,y) and
+ * for neighbors. */
+static av_always_inline
+void set_significance(Jpeg2000T1Context *t1, int x, int y, int negative)
+{
+    uint16_t *p = t1->flags + (y + 1) * t1->stride + x + 1;
+    /* The sign bits of the four edge neighbors are updated together; keeping
+     * the update branchless matters because the sign is close to random. */
+    unsigned sgn = (unsigned)-(negative != 0) &
+                   (JPEG2000_T1_SGN_N | JPEG2000_T1_SGN_S |
+                    JPEG2000_T1_SGN_W | JPEG2000_T1_SGN_E);
+
+    p[0]               |= JPEG2000_T1_SIG;
+    p[1]               |= JPEG2000_T1_SIG_W | (sgn & JPEG2000_T1_SGN_W);
+    p[-1]              |= JPEG2000_T1_SIG_E | (sgn & JPEG2000_T1_SGN_E);
+    p[t1->stride]      |= JPEG2000_T1_SIG_N | (sgn & JPEG2000_T1_SGN_N);
+    p[-t1->stride]     |= JPEG2000_T1_SIG_S | (sgn & JPEG2000_T1_SGN_S);
+    p[t1->stride + 1]  |= JPEG2000_T1_SIG_NW;
+    p[t1->stride - 1]  |= JPEG2000_T1_SIG_NE;
+    p[-t1->stride + 1] |= JPEG2000_T1_SIG_SW;
+    p[-t1->stride - 1] |= JPEG2000_T1_SIG_SE;
+}
+
 static void encode_sigpass(Jpeg2000T1Context *t1, int width, int height, int bandno, int *nmsedec, int bpno)
 {
     int y0, x, y, mask = 1 << (bpno + NMSEDEC_FRACBITS);
@@ -558,7 +581,7 @@ static void encode_sigpass(Jpeg2000T1Context *t1, int width, int height, int ban
                         int ctxno = ff_jpeg2000_getsgnctxno(t1->flags[(y+1) * t1->stride + x+1], &xorbit);
                         ff_mqc_encode(&t1->mqc, t1->mqc.cx_states + ctxno, (t1->flags[(y+1) * t1->stride + x+1] >> 15) ^ xorbit);
                         *nmsedec += getnmsedec_sig(t1->data[(y) * t1->stride + x], bpno + NMSEDEC_FRACBITS);
-                        ff_jpeg2000_set_significance(t1, x, y, t1->flags[(y+1) * t1->stride + x+1] >> 15);
+                        set_significance(t1, x, y, t1->flags[(y+1) * t1->stride + x+1] >> 15);
                     }
                     t1->flags[(y+1) * t1->stride + x+1] |= JPEG2000_T1_VIS;
                 }
@@ -610,7 +633,7 @@ static void encode_clnpass(Jpeg2000T1Context *t1, int width, int height, int ban
                             int ctxno = ff_jpeg2000_getsgnctxno(t1->flags[(y+1) * t1->stride + x+1], &xorbit);
                             *nmsedec += getnmsedec_sig(t1->data[(y) * t1->stride + x], bpno + NMSEDEC_FRACBITS);
                             ff_mqc_encode(&t1->mqc, t1->mqc.cx_states + ctxno, (t1->flags[(y+1) * t1->stride + x+1] >> 15) ^ xorbit);
-                            ff_jpeg2000_set_significance(t1, x, y, t1->flags[(y+1) * t1->stride + x+1] >> 15);
+                            set_significance(t1, x, y, t1->flags[(y+1) * t1->stride + x+1] >> 15);
                         }
                     }
                     t1->flags[(y+1) * t1->stride + x+1] &= ~JPEG2000_T1_VIS;
@@ -625,7 +648,7 @@ static void encode_clnpass(Jpeg2000T1Context *t1, int width, int height, int ban
                             int ctxno = ff_jpeg2000_getsgnctxno(t1->flags[(y+1) * t1->stride + x+1], &xorbit);
                             *nmsedec += getnmsedec_sig(t1->data[(y) * t1->stride + x], bpno + NMSEDEC_FRACBITS);
                             ff_mqc_encode(&t1->mqc, t1->mqc.cx_states + ctxno, (t1->flags[(y+1) * t1->stride + x+1] >> 15) ^ xorbit);
-                            ff_jpeg2000_set_significance(t1, x, y, t1->flags[(y+1) * t1->stride + x+1] >> 15);
+                            set_significance(t1, x, y, t1->flags[(y+1) * t1->stride + x+1] >> 15);
                         }
                     }
                     t1->flags[(y+1) * t1->stride + x+1] &= ~JPEG2000_T1_VIS;

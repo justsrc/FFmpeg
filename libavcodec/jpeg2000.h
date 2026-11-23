@@ -133,7 +133,10 @@ enum Jpeg2000Quantsty { // quantization style
 
 typedef struct Jpeg2000T1Context {
     int data[6144];
-    uint16_t flags[6156];
+    union {
+        uint16_t flags[6156];   ///< a word per coefficient; the encoder
+        uint32_t flags32[3078]; ///< a word per stripe column; the decoder
+    };
     MqcState mqc;
     int stride;
 } Jpeg2000T1Context;
@@ -264,13 +267,15 @@ void ff_jpeg2000_init_tier1_luts(void);
 void ff_jpeg2000_set_significance(Jpeg2000T1Context *t1,
                                   int x, int y, int negative);
 
-extern uint8_t ff_jpeg2000_sigctxno_lut[256][4];
+extern uint8_t ff_jpeg2000_sigctxno_lut[4][256];
+extern uint8_t ff_jpeg2000_sigctxno_window_lut[4][512];
+extern uint16_t ff_jpeg2000_sgnctxno_packed_lut[256];
 
 /* Get context label (number in range[0..8]) of a coefficient for significance
  * propagation and cleanup coding passes. */
 static inline int ff_jpeg2000_getsigctxno(int flag, int bandno)
 {
-    return ff_jpeg2000_sigctxno_lut[flag & 255][bandno];
+    return ff_jpeg2000_sigctxno_lut[bandno][flag & 255];
 }
 
 static const uint8_t refctxno_lut[2][2] = { { 14, 15 }, { 16, 16 } };
@@ -282,14 +287,15 @@ static inline int ff_jpeg2000_getrefctxno(int flag)
     return refctxno_lut[(flag >> 14) & 1][(flag & 255) != 0];
 }
 
-extern uint8_t ff_jpeg2000_sgnctxno_lut[16][16];
-extern uint8_t ff_jpeg2000_xorbit_lut[16][16];
+extern uint8_t ff_jpeg2000_sgn_lut[16][16];
 
-/* Get context label (number in range[9..13]) for sign decoding. */
+/* Context label (9..13) in the low nibble, XOR bit in bit 4. */
 static inline int ff_jpeg2000_getsgnctxno(int flag, int *xorbit)
 {
-    *xorbit = ff_jpeg2000_xorbit_lut[flag & 15][(flag >> 8) & 15];
-    return ff_jpeg2000_sgnctxno_lut[flag & 15][(flag >> 8) & 15];
+    int s = ff_jpeg2000_sgn_lut[flag & 15][(flag >> 8) & 15];
+
+    *xorbit = s >> 4;
+    return s & 15;
 }
 
 /* Node count of the tag-tree pyramid over a (w, h) leaf grid. */
