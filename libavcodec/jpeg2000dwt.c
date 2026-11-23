@@ -25,6 +25,8 @@
  * Discrete wavelet transform
  */
 
+#include <string.h>
+
 #include "libavutil/error.h"
 #include "libavutil/macros.h"
 #include "libavutil/mem.h"
@@ -457,21 +459,45 @@ static void dwt_decode97_float(DWTContext *s, float *t)
             int eoff = mh ? c1 : 0, ooff = mh ? 0 : c1;
             int cE = mh ? c2 : c1, cO = mh ? c1 : c2;
             const int cmin = FFMIN(cE, cO);
-            const float *src = data + (size_t)w * lp;
+            const float *restrict src = data + (size_t)w * lp;
+            const float *restrict srcE = src + eoff;
+            const float *restrict srcO = src + ooff;
+            float *restrict dst = l;
 
-            for (j = 0; j < cmin; j++) {
-                l[2 * j]     = src[eoff + j];
-                l[2 * j + 1] = src[ooff + j];
+            /* Four index pairs per iteration: the two loads become one
+             * 128-bit load per source, and the two interleaved stores one
+             * 256-bit store, so the permutation runs at memory speed
+             * instead of one scalar load/store pair per coefficient. */
+            for (j = 0; j + 4 <= cmin; j += 4) {
+                float e0 = srcE[j], e1 = srcE[j + 1];
+                float e2 = srcE[j + 2], e3 = srcE[j + 3];
+                float o0 = srcO[j], o1 = srcO[j + 1];
+                float o2 = srcO[j + 2], o3 = srcO[j + 3];
+
+                dst[2 * j]      = e0;
+                dst[2 * j + 1]  = o0;
+                dst[2 * j + 2]  = e1;
+                dst[2 * j + 3]  = o1;
+                dst[2 * j + 4]  = e2;
+                dst[2 * j + 5]  = o2;
+                dst[2 * j + 6]  = e3;
+                dst[2 * j + 7]  = o3;
+            }
+            for (; j < cmin; j++) {
+                dst[2 * j]     = srcE[j];
+                dst[2 * j + 1] = srcO[j];
             }
             for (; j < cE; j++)
-                l[2 * j] = src[eoff + j];
+                dst[2 * j] = srcE[j];
             for (; j < cO; j++)
-                l[2 * j + 1] = src[ooff + j];
+                dst[2 * j + 1] = srcO[j];
 
             sr_1d97_float(line, mh, mh + lh);
 
-            for (j = 0; j < lh; j++)
-                data[(size_t)w * lp + j] = l[j];
+            /* The lifted line is moved back unchanged; memcpy lets the
+             * compiler emit a vector copy instead of an aliasing-limited
+             * scalar loop. */
+            memcpy(data + (size_t)w * lp, l, (size_t)lh * sizeof(float));
         }
 
         // VER_SD
