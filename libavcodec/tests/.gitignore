@@ -20,6 +20,7 @@
 /mjpegenc_huffman
 /mpeg12framerate
 /mpegaudiodecheader
+/mqc
 /packet_side_data_handle
 /qpfile_parser
 /rangecoder

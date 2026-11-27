@@ -32,6 +32,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/intmath.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
@@ -1894,125 +1895,391 @@ static int jpeg2000_decode_packets(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile
 }
 
 /* TIER-1 routines */
-static void decode_sigpass(Jpeg2000T1Context *t1, int width, int height,
+/* Tier-1 passes over packed stripe-column flags.
+ *
+ * One 32-bit word describes a four-row column of the codeblock. Bits 0-17
+ * hold the significances of the 3x6 neighbourhood: bit 3*(row + 1) + (col + 1)
+ * is the significance of neighbour (row, col), row -1 being the last row of
+ * the stripe above and row 4 the first row of the stripe below. Bits 18-31
+ * hold the signs and the per-row marks: bit 18 the sign of the row above the
+ * stripe, bits 19 + 3*row, 20 + 3*row and 21 + 3*row the sign, refinement
+ * mark and visited mark of row `row`, and bit 31 the sign of the row below
+ * the stripe.
+ *
+ * Shifting a word right by 3*row aligns that row's 3x3 window on bits 0-8,
+ * so each context is a shift, a mask and one table load, and a coefficient
+ * that becomes significant updates three words instead of nine.
+ */
+
+#define J2K_T1_SIGMA_THIS       (1u << 4)
+#define J2K_T1_SIGMA_NEIGHBOURS 0x1EFu
+#define J2K_T1_MU_THIS          (1u << 20)
+#define J2K_T1_PI_THIS          (1u << 21)
+#define J2K_T1_PI_ALL           (J2K_T1_PI_THIS | (J2K_T1_PI_THIS << 3) | \
+                                 (J2K_T1_PI_THIS << 6) | (J2K_T1_PI_THIS << 9))
+#define J2K_T1_ROW_BITS         0x249u
+/* The row below the stripe, which a vertically causal context ignores. */
+#define J2K_T1_VSC_NEIGHBOURS   0x38000u
+#define J2K_T1_VSC_MASK         (~(J2K_T1_VSC_NEIGHBOURS | 0x80000000u))
+
+static av_always_inline uint32_t j2k_t1_uncoded_rows(uint32_t own)
+{
+    return ~((own >> 4) | (own >> 21)) & J2K_T1_ROW_BITS;
+}
+
+/* Rows that have a significant neighbour and were not visited yet. Bit 3*row
+ * marks row `row`; the neighbourhood terms are the west/centre/east of the
+ * row itself and of the row two below, plus the west/east of the row below,
+ * which is the eight neighbours without the centre. */
+static av_always_inline uint32_t j2k_t1_propagation_rows(uint32_t own)
+{
+    uint32_t any_in_row = own | (own >> 1) | (own >> 2);
+    uint32_t neighbours = any_in_row | (any_in_row >> 6) |
+                          (own >> 3) | (own >> 5);
+
+    return neighbours & j2k_t1_uncoded_rows(own);
+}
+
+/* Record that the coefficient in row `shift / 3` of the column word at
+ * `index` became significant with `sign`. Setting the row's own bit also
+ * gives the row above its south neighbour and the row below its north
+ * neighbour, so only the two adjacent columns and a stripe edge need
+ * separate writes. */
+static av_always_inline void j2k_t1_set_significant(uint32_t *flags,
+                                                    uint32_t *own, int index,
+                                                    int stride, unsigned shift,
+                                                    unsigned sign)
+{
+    *own |= (J2K_T1_SIGMA_THIS | (sign << 19)) << shift;
+    flags[index - 1] |= (1u << 5) << shift;
+    flags[index + 1] |= (1u << 3) << shift;
+
+    if (!shift) {
+        int north = index - stride;
+
+        flags[north - 1] |= 1u << 17;
+        flags[north]     |= (1u << 16) | (sign << 31);
+        flags[north + 1] |= 1u << 15;
+    } else if (shift == 9) {
+        int south = index + stride;
+
+        flags[south - 1] |= 1u << 2;
+        flags[south]     |= (1u << 1) | (sign << 18);
+        flags[south + 1] |= 1u;
+    }
+}
+
+/* Sign context (9-13) in the low byte and the XOR bit above it, keyed by the
+ * cardinal neighbours' significances and signs. */
+static av_always_inline unsigned j2k_t1_sign_context(uint32_t own,
+                                                     uint32_t left,
+                                                     uint32_t right,
+                                                     unsigned shift, int vsc)
+{
+    uint32_t window = own, sgn_own = own;
+    unsigned significances, signs;
+
+    if (vsc && shift == 9) {
+        window  &= ~J2K_T1_VSC_NEIGHBOURS;
+        sgn_own &= J2K_T1_VSC_MASK;
+    }
+    /* Align the row's window on bits 0-8; the sign offsets below already
+     * carry `shift` because the signs live in the unshifted word. */
+    window >>= shift;
+    significances = (((window >> 1) & 1) << 6) |
+                    (((window >> 3) & 1) << 4) |
+                    (((window >> 5) & 1) << 2) | ((window >> 7) & 1);
+    /* Significances in bits 6/4/2/0 (N/W/E/S) and signs in 7/5/3/1, the key
+     * layout of the packed sign-context table; the north sign of a stripe's
+     * first row and the south sign of its last row are the stripe-edge bits. */
+    signs = (((sgn_own >> (shift ? 16 + shift : 18)) & 1) << 7) |
+            (((left    >> (19 + shift)) & 1) << 5) |
+            (((right   >> (19 + shift)) & 1) << 3) |
+            (((sgn_own >> (22 + shift)) & 1) << 1);
+
+    return ff_jpeg2000_sgnctxno_packed_lut[significances | signs];
+}
+
+static av_always_inline unsigned j2k_t1_zero_context(const uint8_t *lut,
+                                                     uint32_t own,
+                                                     unsigned shift, int vsc)
+{
+    if (vsc && shift == 9)
+        own &= ~J2K_T1_VSC_NEIGHBOURS;
+
+    return lut[(own >> shift) & J2K_T1_SIGMA_NEIGHBOURS];
+}
+
+static av_always_inline void decode_sigpass_core(Jpeg2000T1Context *t1,
+                                                 MqcState *mqc, int width,
+                                                 int height, int bpno,
+                                                 int bandno, int vsc)
+{
+    uint32_t *const flags = t1->flags32;
+    const int stride = t1->stride;
+    const unsigned mask = (3u << bpno) >> 1;
+    const uint32_t vsc_mask = vsc ? J2K_T1_VSC_MASK : ~0u;
+    const uint8_t *const ctxlut = ff_jpeg2000_sigctxno_window_lut[bandno];
+    int y0, x;
+
+    for (y0 = 0; y0 < height; y0 += 4) {
+        const int rows = FFMIN(height - y0, 4);
+        const uint32_t rows_mask = J2K_T1_ROW_BITS &
+                                   ((1u << (3 * rows)) - 1);
+        const int flag_base = ((y0 >> 2) + 1) * stride + 1;
+        int *const data = t1->data + y0 * stride;
+
+        for (x = 0; x < width; x++) {
+            const int fi = flag_base + x;
+            uint32_t own = flags[fi];
+            uint32_t candidates = j2k_t1_propagation_rows(own & vsc_mask) &
+                                  rows_mask;
+
+            if (!candidates)
+                continue;
+
+            do {
+                const unsigned shift = ff_ctz(candidates);
+                const unsigned ctxno = j2k_t1_zero_context(ctxlut, own,
+                                                           shift, vsc);
+
+                own |= J2K_T1_PI_THIS << shift;
+                if (ff_mqc_decode_inline(mqc, mqc->cx_states + ctxno)) {
+                    const unsigned sc = j2k_t1_sign_context(own,
+                                                            flags[fi - 1],
+                                                            flags[fi + 1],
+                                                            shift, vsc);
+                    unsigned sign = ff_mqc_decode_inline(mqc, mqc->cx_states +
+                                                         (sc & 0xff));
+
+                    if (!mqc->raw)
+                        sign ^= sc >> 8;
+                    data[(shift / 3) * stride + x] |= (sign << 31) | mask;
+                    j2k_t1_set_significant(flags, &own, fi, stride, shift,
+                                           sign);
+                    /* The new coefficient is a neighbour of the rows below. */
+                    candidates = j2k_t1_propagation_rows(own & vsc_mask) &
+                                 rows_mask & (~0u << (shift + 1));
+                } else {
+                    candidates &= candidates - 1;
+                }
+            } while (candidates);
+
+            flags[fi] = own;
+        }
+    }
+}
+
+static void decode_sigpass(Jpeg2000T1Context *t1, MqcState *mqc,
+                           int width, int height,
                            int bpno, int bandno,
                            int vert_causal_ctx_csty_symbol)
 {
-    int mask = (3u << bpno)>>1, y0, x, y;
-
-    for (y0 = 0; y0 < height; y0 += 4)
-        for (x = 0; x < width; x++)
-            for (y = y0; y < height && y < y0 + 4; y++) {
-                int flags_mask = -1;
-                if (vert_causal_ctx_csty_symbol && y == y0 + 3)
-                    flags_mask &= ~(JPEG2000_T1_SIG_S | JPEG2000_T1_SIG_SW | JPEG2000_T1_SIG_SE | JPEG2000_T1_SGN_S);
-                if ((t1->flags[(y+1) * t1->stride + x+1] & JPEG2000_T1_SIG_NB & flags_mask)
-                && !(t1->flags[(y+1) * t1->stride + x+1] & (JPEG2000_T1_SIG | JPEG2000_T1_VIS))) {
-                    if (ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ff_jpeg2000_getsigctxno(t1->flags[(y+1) * t1->stride + x+1] & flags_mask, bandno))) {
-                        int xorbit, ctxno = ff_jpeg2000_getsgnctxno(t1->flags[(y+1) * t1->stride + x+1] & flags_mask, &xorbit);
-                        if (t1->mqc.raw) {
-                            t1->data[(y) * t1->stride + x] |= (uint32_t)(ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno)) << 31;
-                            t1->data[(y) * t1->stride + x] |= mask;
-                        } else {
-                            t1->data[(y) * t1->stride + x] |= (uint32_t)(ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno) ^ xorbit) << 31;
-                            t1->data[(y) * t1->stride + x] |= mask;
-                        }
-                        ff_jpeg2000_set_significance(t1, x, y,
-                                                     t1->data[(y) * t1->stride + x] & INT32_MIN);
-                    }
-                    t1->flags[(y + 1) * t1->stride + x + 1] |= JPEG2000_T1_VIS;
-                }
-            }
+    if (vert_causal_ctx_csty_symbol)
+        decode_sigpass_core(t1, mqc, width, height, bpno, bandno, 1);
+    else
+        decode_sigpass_core(t1, mqc, width, height, bpno, bandno, 0);
 }
 
-static void decode_refpass(Jpeg2000T1Context *t1, int width, int height,
-                           int bpno, int vert_causal_ctx_csty_symbol)
+static av_always_inline void decode_refpass_core(Jpeg2000T1Context *t1,
+                                                 MqcState *mqc, int width,
+                                                 int height, int bpno,
+                                                 int vsc)
 {
-    int phalf;
-    int y0, x, y;
-
-    phalf = 1 << bpno;
-
-    for (y0 = 0; y0 < height; y0 += 4)
-        for (x = 0; x < width; x++)
-            for (y = y0; y < height && y < y0 + 4; y++)
-                if ((t1->flags[(y + 1) * t1->stride + x + 1] & (JPEG2000_T1_SIG | JPEG2000_T1_VIS)) == JPEG2000_T1_SIG) {
-                    int flags_mask = (vert_causal_ctx_csty_symbol && y == y0 + 3) ?
-                        ~(JPEG2000_T1_SIG_S | JPEG2000_T1_SIG_SW | JPEG2000_T1_SIG_SE | JPEG2000_T1_SGN_S) : -1;
-                    int ctxno = ff_jpeg2000_getrefctxno(t1->flags[(y + 1) * t1->stride + x + 1] & flags_mask);
-                    t1->data[(y) * t1->stride + x] |= phalf >> 1;
-                    if (ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno))
-                        t1->data[(y) * t1->stride + x] |= phalf;
-                    else {
-                        t1->data[(y) * t1->stride + x] &= ~(phalf);
-
-                    }
-                    t1->flags[(y + 1) * t1->stride + x + 1] |= JPEG2000_T1_REF;
-                }
-}
-
-static void decode_clnpass(const Jpeg2000DecoderContext *s, Jpeg2000T1Context *t1,
-                           int width, int height, int bpno, int bandno,
-                           int seg_symbols, int vert_causal_ctx_csty_symbol)
-{
-    int mask = (3u << bpno)>>1, y0, x, y, runlen, dec;
+    uint32_t *const flags = t1->flags32;
+    const int stride = t1->stride;
+    const int phalf = 1 << bpno;
+    const uint32_t vsc_mask = vsc ? J2K_T1_VSC_MASK : ~0u;
+    int y0, x;
 
     for (y0 = 0; y0 < height; y0 += 4) {
-        for (x = 0; x < width; x++) {
-            int flags_mask = -1;
-            if (vert_causal_ctx_csty_symbol)
-                flags_mask &= ~(JPEG2000_T1_SIG_S | JPEG2000_T1_SIG_SW | JPEG2000_T1_SIG_SE | JPEG2000_T1_SGN_S);
-            if (y0 + 3 < height &&
-                !((t1->flags[(y0 + 1) * t1->stride + x + 1] & (JPEG2000_T1_SIG_NB | JPEG2000_T1_VIS | JPEG2000_T1_SIG)) ||
-                  (t1->flags[(y0 + 2) * t1->stride + x + 1] & (JPEG2000_T1_SIG_NB | JPEG2000_T1_VIS | JPEG2000_T1_SIG)) ||
-                  (t1->flags[(y0 + 3) * t1->stride + x + 1] & (JPEG2000_T1_SIG_NB | JPEG2000_T1_VIS | JPEG2000_T1_SIG)) ||
-                  (t1->flags[(y0 + 4) * t1->stride + x + 1] & (JPEG2000_T1_SIG_NB | JPEG2000_T1_VIS | JPEG2000_T1_SIG) & flags_mask))) {
-                if (!ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + MQC_CX_RL))
-                    continue;
-                runlen = ff_mqc_decode(&t1->mqc,
-                                       t1->mqc.cx_states + MQC_CX_UNI);
-                runlen = (runlen << 1) | ff_mqc_decode(&t1->mqc,
-                                                       t1->mqc.cx_states +
-                                                       MQC_CX_UNI);
-                dec = 1;
-            } else {
-                runlen = 0;
-                dec    = 0;
-            }
+        const int rows = FFMIN(height - y0, 4);
+        const uint32_t rows_mask = J2K_T1_ROW_BITS &
+                                   ((1u << (3 * rows)) - 1);
+        const int flag_base = ((y0 >> 2) + 1) * stride + 1;
+        int *const data = t1->data + y0 * stride;
 
-            for (y = y0 + runlen; y < y0 + 4 && y < height; y++) {
-                int flags_mask = -1;
-                if (vert_causal_ctx_csty_symbol && y == y0 + 3)
-                    flags_mask &= ~(JPEG2000_T1_SIG_S | JPEG2000_T1_SIG_SW | JPEG2000_T1_SIG_SE | JPEG2000_T1_SGN_S);
-                if (!dec) {
-                    if (!(t1->flags[(y+1) * t1->stride + x+1] & (JPEG2000_T1_SIG | JPEG2000_T1_VIS))) {
-                        dec = ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ff_jpeg2000_getsigctxno(t1->flags[(y+1) * t1->stride + x+1] & flags_mask,
-                                                                                             bandno));
-                    }
-                }
-                if (dec) {
-                    int xorbit;
-                    int ctxno = ff_jpeg2000_getsgnctxno(t1->flags[(y + 1) * t1->stride + x + 1] & flags_mask,
-                                                        &xorbit);
-                    t1->data[(y) * t1->stride + x] |= (uint32_t)(ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno) ^ xorbit) << 31;
-                    t1->data[(y) * t1->stride + x] |= mask;
-                    ff_jpeg2000_set_significance(t1, x, y, t1->data[(y) * t1->stride + x] & INT32_MIN);
-                }
-                dec = 0;
-                t1->flags[(y + 1) * t1->stride + x + 1] &= ~JPEG2000_T1_VIS;
-            }
+        for (x = 0; x < width; x++) {
+            const int fi = flag_base + x;
+            uint32_t own = flags[fi];
+            /* Significant before this bitplane's significance pass. */
+            uint32_t candidates = (own >> 4) & ~(own >> 21) & rows_mask;
+
+            if (!candidates)
+                continue;
+
+            do {
+                const unsigned shift = ff_ctz(candidates);
+                const uint32_t window = (own & vsc_mask) >> shift;
+                const unsigned ctxno = (window & J2K_T1_MU_THIS) ? 16 :
+                                       (window & J2K_T1_SIGMA_NEIGHBOURS) ?
+                                       15 : 14;
+                int *const coeff = &data[(shift / 3) * stride + x];
+
+                *coeff |= phalf >> 1;
+                if (ff_mqc_decode_inline(mqc, mqc->cx_states + ctxno))
+                    *coeff |= phalf;
+                else
+                    *coeff &= ~phalf;
+                own |= J2K_T1_MU_THIS << shift;
+                candidates &= candidates - 1;
+            } while (candidates);
+
+            flags[fi] = own;
         }
     }
+}
+
+static void decode_refpass(Jpeg2000T1Context *t1, MqcState *mqc,
+                           int width, int height,
+                           int bpno, int vert_causal_ctx_csty_symbol)
+{
+    if (vert_causal_ctx_csty_symbol)
+        decode_refpass_core(t1, mqc, width, height, bpno, 1);
+    else
+        decode_refpass_core(t1, mqc, width, height, bpno, 0);
+}
+
+static av_always_inline void
+decode_clnpass_core(const Jpeg2000DecoderContext *s,
+                    Jpeg2000T1Context *t1, MqcState *mqc,
+                    int width, int height, int bpno, int bandno,
+                    int seg_symbols, int vsc)
+{
+    uint32_t *const flags = t1->flags32;
+    const int stride = t1->stride;
+    const unsigned mask = (3u << bpno) >> 1;
+    const uint32_t vsc_mask = vsc ? J2K_T1_VSC_MASK : ~0u;
+    const uint8_t *const ctxlut = ff_jpeg2000_sigctxno_window_lut[bandno];
+    int y0, x;
+
+    for (y0 = 0; y0 < height; y0 += 4) {
+        const int rows = FFMIN(height - y0, 4);
+        const uint32_t rows_mask = J2K_T1_ROW_BITS &
+                                   ((1u << (3 * rows)) - 1);
+        const int flag_base = ((y0 >> 2) + 1) * stride + 1;
+        int *const data = t1->data + y0 * stride;
+
+        for (x = 0; x < width; ) {
+            const int fi = flag_base + x;
+            uint32_t own = flags[fi];
+            uint32_t candidates;
+
+            /* A zero word is a full column of insignificant, unvisited
+             * coefficients with zero contexts: the run-length case. */
+            if (rows_mask == J2K_T1_ROW_BITS && !(own & vsc_mask)) {
+                uint32_t run = 0, qe = 0;
+
+                if (!mqc->raw && !(mqc->cx_states[MQC_CX_RL] & 1)) {
+                    uint32_t renorm_floor =
+                        FFMAX((uint32_t)(mqc->c64 >> 48) + 1, 0x8000);
+
+                    qe  = ff_mqc_packed[mqc->cx_states[MQC_CX_RL]] & 0xffff;
+                    run = mqc->a > renorm_floor ?
+                          (mqc->a - renorm_floor) / qe : 0;
+                }
+                /* While the run-length context's MPS is a zero and it
+                 * decodes without renormalizing, every zero word decodes
+                 * that zero and changes nothing but A. */
+                if (run) {
+                    unsigned limit = FFMIN(run, (uint32_t)(width - x));
+                    unsigned cols  = 1;
+
+                    while (cols < limit && !(flags[fi + cols] & vsc_mask))
+                        cols++;
+                    mqc->a -= cols * qe;
+                    x += cols;
+                    continue;
+                }
+                if (!ff_mqc_decode_inline(mqc, mqc->cx_states + MQC_CX_RL)) {
+                    x++;
+                    continue;
+                }
+                {
+                    unsigned first = ff_mqc_decode_inline(mqc,
+                                                          mqc->cx_states +
+                                                          MQC_CX_UNI);
+                    unsigned shift, sc, sign;
+                    int row;
+
+                    first = (first << 1) |
+                            ff_mqc_decode_inline(mqc, mqc->cx_states +
+                                                 MQC_CX_UNI);
+                    shift = 3 * first;
+                    sc    = j2k_t1_sign_context(own, flags[fi - 1],
+                                                flags[fi + 1], shift, vsc);
+                    sign  = ff_mqc_decode_inline(mqc, mqc->cx_states +
+                                                 (sc & 0xff)) ^ (sc >> 8);
+                    data[first * stride + x] |= (sign << 31) | mask;
+                    j2k_t1_set_significant(flags, &own, fi, stride, shift,
+                                           sign);
+                    for (row = first + 1; row < 4; row++) {
+                        shift = 3 * row;
+                        if (!ff_mqc_decode_inline(mqc, mqc->cx_states +
+                                                  j2k_t1_zero_context(ctxlut,
+                                                                      own,
+                                                                      shift,
+                                                                      vsc)))
+                            continue;
+                        sc   = j2k_t1_sign_context(own, flags[fi - 1],
+                                                   flags[fi + 1], shift, vsc);
+                        sign = ff_mqc_decode_inline(mqc, mqc->cx_states +
+                                                    (sc & 0xff)) ^ (sc >> 8);
+                        data[row * stride + x] |= (sign << 31) | mask;
+                        j2k_t1_set_significant(flags, &own, fi, stride, shift,
+                                               sign);
+                    }
+                }
+            } else {
+                candidates = j2k_t1_uncoded_rows(own) & rows_mask;
+                while (candidates) {
+                    const unsigned shift = ff_ctz(candidates);
+                    const unsigned ctxno = j2k_t1_zero_context(ctxlut, own,
+                                                               shift, vsc);
+
+                    if (ff_mqc_decode_inline(mqc, mqc->cx_states + ctxno)) {
+                        const unsigned sc =
+                            j2k_t1_sign_context(own, flags[fi - 1],
+                                                flags[fi + 1], shift, vsc);
+                        const unsigned sign =
+                            ff_mqc_decode_inline(mqc, mqc->cx_states +
+                                                 (sc & 0xff)) ^ (sc >> 8);
+
+                        data[(shift / 3) * stride + x] |= (sign << 31) | mask;
+                        j2k_t1_set_significant(flags, &own, fi, stride, shift,
+                                               sign);
+                    }
+                    candidates &= candidates - 1;
+                }
+            }
+            flags[fi] = own & ~J2K_T1_PI_ALL;
+            x++;
+        }
+    }
+
     if (seg_symbols) {
-        int val;
-        val = ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + MQC_CX_UNI);
-        val = (val << 1) + ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + MQC_CX_UNI);
-        val = (val << 1) + ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + MQC_CX_UNI);
-        val = (val << 1) + ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + MQC_CX_UNI);
+        int val = 0, i;
+
+        for (i = 0; i < 4; i++)
+            val = (val << 1) | ff_mqc_decode_inline(mqc, mqc->cx_states +
+                                                    MQC_CX_UNI);
         if (val != 0xa)
             av_log(s->avctx, AV_LOG_ERROR,
                    "Segmentation symbol value incorrect\n");
     }
+}
+
+static void decode_clnpass(const Jpeg2000DecoderContext *s,
+                           Jpeg2000T1Context *t1, MqcState *mqc,
+                           int width, int height, int bpno, int bandno,
+                           int seg_symbols, int vert_causal_ctx_csty_symbol)
+{
+    if (vert_causal_ctx_csty_symbol)
+        decode_clnpass_core(s, t1, mqc, width, height, bpno, bandno,
+                            seg_symbols, 1);
+    else
+        decode_clnpass_core(s, t1, mqc, width, height, bpno, bandno,
+                            seg_symbols, 0);
 }
 
 static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *codsty,
@@ -2024,6 +2291,7 @@ static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *cod
     int vert_causal_ctx_csty_symbol = codsty->cblk_style & JPEG2000_CBLK_VSC;
     int term_cnt = 0;
     int coder_type;
+    MqcState mqc;
 
     av_assert0(width <= 1024U && height <= 1024U);
     av_assert0(width*height <= 4096);
@@ -2034,11 +2302,12 @@ static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *cod
     if (!cblk->length || !cblk->nonzerobits)
         return 0;
 
-    memset(t1->flags, 0, t1->stride * (height + 2) * sizeof(*t1->flags));
+    memset(t1->flags32, 0,
+           t1->stride * ((height + 3) / 4 + 2) * sizeof(*t1->flags32));
 
     cblk->data[cblk->length] = 0xff;
     cblk->data[cblk->length+1] = 0xff;
-    ff_mqc_initdec(&t1->mqc, cblk->data, 0, 1);
+    ff_mqc_initdec(&mqc, cblk->data, 0, 1);
 
     while (passno--) {
         if (bpno < -1 || bpno > 29) {
@@ -2047,34 +2316,37 @@ static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *cod
         }
         switch(pass_t) {
         case 0:
-            decode_sigpass(t1, width, height, bpno + 1, bandpos,
+            decode_sigpass(t1, &mqc, width, height, bpno + 1, bandpos,
                            vert_causal_ctx_csty_symbol);
             break;
         case 1:
-            decode_refpass(t1, width, height, bpno + 1, vert_causal_ctx_csty_symbol);
+            decode_refpass(t1, &mqc, width, height, bpno + 1,
+                           vert_causal_ctx_csty_symbol);
             break;
         case 2:
-            av_assert2(!t1->mqc.raw);
-            decode_clnpass(s, t1, width, height, bpno + 1, bandpos,
+            av_assert2(!mqc.raw);
+            decode_clnpass(s, t1, &mqc, width, height, bpno + 1, bandpos,
                            codsty->cblk_style & JPEG2000_CBLK_SEGSYM,
                            vert_causal_ctx_csty_symbol);
             break;
         }
         if (codsty->cblk_style & JPEG2000_CBLK_RESET) // XXX no testcase for just this
-            ff_mqc_init_contexts(&t1->mqc);
+            ff_mqc_init_contexts(&mqc);
 
         if (passno && (coder_type = needs_termination(codsty->cblk_style, pass_cnt))) {
             if (term_cnt >= cblk->nb_terminations) {
                 av_log(s->avctx, AV_LOG_ERROR, "Missing needed termination \n");
                 return AVERROR_INVALIDDATA;
             }
-            if (FFABS(cblk->data + cblk->data_start[term_cnt + 1] - 2 - t1->mqc.bp) > 0) {
+            if (FFABS(cblk->data + cblk->data_start[term_cnt + 1] - 2 -
+                      mqc.bp) > 0) {
                 av_log(s->avctx, AV_LOG_WARNING, "Mid mismatch %td in pass %d of %d\n",
-                    cblk->data + cblk->data_start[term_cnt + 1] - 2 - t1->mqc.bp,
+                    cblk->data + cblk->data_start[term_cnt + 1] - 2 - mqc.bp,
                     pass_cnt, cblk->npasses);
             }
 
-            ff_mqc_initdec(&t1->mqc, cblk->data + cblk->data_start[++term_cnt], coder_type == 2, 0);
+            ff_mqc_initdec(&mqc, cblk->data + cblk->data_start[++term_cnt],
+                           coder_type == 2, 0);
         }
 
         pass_t++;
@@ -2085,29 +2357,37 @@ static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *cod
         pass_cnt ++;
     }
 
-    if (cblk->data + cblk->length - 2 > t1->mqc.bp) {
+    if (cblk->data + cblk->length - 2 > mqc.bp) {
         av_log(s->avctx, AV_LOG_WARNING, "End mismatch %td\n",
-               cblk->data + cblk->length - 2 - t1->mqc.bp);
+               cblk->data + cblk->length - 2 - mqc.bp);
     }
 
-    if (cblk->data + cblk->length < t1->mqc.bp) {
+    if (cblk->data + cblk->length < mqc.bp) {
         av_log(s->avctx, AV_LOG_WARNING, "Synthetic End of Stream Marker Read.\n");
     }
 
+    /* Without ROI the pass below rewrites every coefficient with its own
+     * value; the samples are already in the form the DWT expects. */
+    if (!roi_shift)
+        return 1;
+
     /* Reconstruct the sample values */
+    /* Bit mask for ROI detection */
+    const uint32_t mask = (int64_t)UINT32_MAX >> (M_b + 1);
+
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int32_t sign, n, val;
-            const uint32_t mask  = (int64_t)UINT32_MAX >> (M_b + 1); // bit mask for ROI detection
 
             n = x + (y * t1->stride);
             val = t1->data[n];
             sign = val & INT32_MIN;
             val &= INT32_MAX;
             /* ROI shift, if necessary */
-            if (roi_shift && (((uint32_t)val & ~mask) == 0))
+            if (((uint32_t)val & ~mask) == 0)
                 val = (uint32_t)val << roi_shift;
-            t1->data[n] = val | sign; /* NOTE: Binary point for reconstruction value is located in 31 - M_b */
+            /* NOTE: binary point of the reconstruction value is at 31 - M_b */
+            t1->data[n] = val | sign;
         }
     }
     return 1;
@@ -2393,6 +2673,74 @@ WRITE_FRAME(16, uint16_t)
 
 #undef WRITE_FRAME
 
+/* Output for a packed format whose three components share one geometry: a
+ * single interleaved pass over the frame instead of three strided ones. */
+static void write_frame_16_packed(const Jpeg2000DecoderContext *s,
+                                  Jpeg2000Tile *tile, AVFrame *picture,
+                                  int precision)
+{
+    Jpeg2000Component *comp = tile->comp;
+    const int cbps  = s->cbps[0];
+    const int shift = precision - cbps;
+    const int off   = 1 << (cbps - 1);
+    const int max   = (1 << cbps) - 1;
+    const int w = comp[0].coord[0][1] -
+                  ff_jpeg2000_ceildiv(s->image_offset_x, s->cdx[0]);
+    const int h = comp[0].coord[1][1] -
+                  ff_jpeg2000_ceildiv(s->image_offset_y, s->cdy[0]);
+    /* Component placement of the per-component path. */
+    const int p0 = s->cdef[0] ? s->cdef[0] - 1 : 0;
+    const int p1 = s->cdef[1] ? s->cdef[1] - 1 : 1;
+    const int p2 = s->cdef[2] ? s->cdef[2] - 1 : 2;
+    int x, y;
+
+    for (y = 0; y < h; y++) {
+        const float *d0 = comp[0].f_data + (ptrdiff_t)y * w;
+        const float *d1 = comp[1].f_data + (ptrdiff_t)y * w;
+        const float *d2 = comp[2].f_data + (ptrdiff_t)y * w;
+        uint16_t *dst = (uint16_t *)picture->data[0] +
+                        (ptrdiff_t)y * (picture->linesize[0] / 2);
+
+        for (x = 0; x < w; x++) {
+            dst[p0] = av_clip(lrintf(d0[x]) + off, 0, max) << shift;
+            dst[p1] = av_clip(lrintf(d1[x]) + off, 0, max) << shift;
+            dst[p2] = av_clip(lrintf(d2[x]) + off, 0, max) << shift;
+            dst += 3;
+        }
+    }
+}
+
+static int can_write_packed(const Jpeg2000DecoderContext *s,
+                            const Jpeg2000Tile *tile)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(s->avctx->pix_fmt);
+    const Jpeg2000Component *c0 = tile->comp;
+    int compno;
+
+    if (s->ncomponents != 3 || s->precision <= 8 || !desc)
+        return 0;
+    if ((desc->flags & AV_PIX_FMT_FLAG_PLANAR) || desc->nb_components != 3)
+        return 0;
+    if (c0->coord[0][0] != ff_jpeg2000_ceildiv(s->image_offset_x, s->cdx[0]) ||
+        c0->coord[1][0] != ff_jpeg2000_ceildiv(s->image_offset_y, s->cdy[0]))
+        return 0;
+    for (compno = 0; compno < 3; compno++) {
+        const Jpeg2000Component *c = tile->comp + compno;
+        const Jpeg2000CodingStyle *cs = tile->codsty + compno;
+
+        if (cs->transform != FF_DWT97 || s->cbps[compno] != s->cbps[0])
+            return 0;
+        if (c->coord[0][0] != c0->coord[0][0] ||
+            c->coord[0][1] != c0->coord[0][1] ||
+            c->coord[1][0] != c0->coord[1][0] ||
+            c->coord[1][1] != c0->coord[1][1])
+            return 0;
+        if (s->cdx[compno] != s->cdx[0] || s->cdy[compno] != s->cdy[0])
+            return 0;
+    }
+    return 1;
+}
+
 static int jpeg2000_decode_tile(AVCodecContext *avctx, void *td,
                                 int jobnr, int threadnr)
 {
@@ -2416,7 +2764,10 @@ static int jpeg2000_decode_tile(AVCodecContext *avctx, void *td,
                         picture->format == AV_PIX_FMT_RGBA64 ||
                         picture->format == AV_PIX_FMT_GRAY16 ? 16 : s->precision;
 
-        write_frame_16(s, tile, picture, precision);
+        if (can_write_packed(s, tile))
+            write_frame_16_packed(s, tile, picture, precision);
+        else
+            write_frame_16(s, tile, picture, precision);
     }
 
     return 0;
